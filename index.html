@@ -139,20 +139,20 @@
       }
       function lane(device) {
         const request = device === 0 ? 'A' : 'B';
-        const id = device === 0 ? 1 : 3;
+        const id = device === 0 ? 0 : 3;
         let markup = '<div class="embed-lane"><div class="embed-device">设备 ' + device + ' · DP' + device + '</div>';
         if (step < 4) {
           markup += '<div class="embed-row">' + token(request, id) + '</div>';
-          if (step >= 2) markup += '<div class="embed-flow" aria-hidden="true">↓</div><div class="embed-row">' + token('A', 1) + token('B', 3) + '</div>';
+          if (step >= 2) markup += '<div class="embed-flow" aria-hidden="true">↓</div><div class="embed-row">' + token('A', 0) + token('B', 3) + '</div>';
           markup += '<div class="embed-flow" aria-hidden="true">↓</div>' + weights(device);
           if (step === 0) {
             markup += '<div class="embed-flow" aria-hidden="true">↓</div><div class="embed-row"><span>请求 ' + request + '</span>' + vector(table[id], device + 1, '请求 ' + request + ' 的查表结果') + '</div>';
           }
           if (step === 3) {
-            markup += '<div class="embed-flow" aria-hidden="true">↓</div><div class="embed-lookup"><span>A · id 1</span>' + vector(device === 0 ? [0, 1] : [0, 0], device === 0 ? 1 : 0, device === 0 ? 'A 本地查表' : 'A 非本地词表，置零') + '<span>B · id 3</span>' + vector(device === 1 ? [2, 1] : [0, 0], device === 1 ? 2 : 0, device === 1 ? 'B 本地查表' : 'B 非本地词表，置零') + '</div>';
+            markup += '<div class="embed-flow" aria-hidden="true">↓</div><div class="embed-lookup"><span>A · id 0</span>' + vector(device === 0 ? [1, 0] : [0, 0], device === 0 ? 1 : 0, device === 0 ? 'A 本地查表' : 'A 非本地词表，置零') + '<span>B · id 3</span>' + vector(device === 1 ? [2, 1] : [0, 0], device === 1 ? 2 : 0, device === 1 ? 'B 本地查表' : 'B 非本地词表，置零') + '</div>';
           }
         } else {
-          markup += '<div class="embed-section-label">请求 ' + request + ' · id ' + id + '</div><div class="embed-contributions"><span class="text-small">来自设备 0</span>' + vector(device === 0 ? [0, 1] : [0, 0], device === 0 ? 1 : 0, '来自设备 0 的部分结果') + '<span class="text-small">来自设备 1</span>' + vector(device === 1 ? [2, 1] : [0, 0], device === 1 ? 2 : 0, '来自设备 1 的部分结果') + '</div><div class="embed-flow">↓ 求和</div><div class="embed-row">' + token(request, id) + vector(table[id], device + 1, '归还请求 ' + request + ' 的完整 Embedding') + '</div><div class="embed-section-label text-small">完整 2 维 → 后续层</div>';
+          markup += '<div class="embed-section-label">请求 ' + request + ' · id ' + id + '</div><div class="embed-contributions"><span class="text-small">来自设备 0</span>' + vector(device === 0 ? [1, 0] : [0, 0], device === 0 ? 1 : 0, '来自设备 0 的部分结果') + '<span class="text-small">来自设备 1</span>' + vector(device === 1 ? [2, 1] : [0, 0], device === 1 ? 2 : 0, '来自设备 1 的部分结果') + '</div><div class="embed-flow">↓ 求和</div><div class="embed-row">' + token(request, id) + vector(table[id], device + 1, '归还请求 ' + request + ' 的完整 Embedding') + '</div><div class="embed-section-label text-small">完整 2 维 → 后续层</div>';
         }
         return markup + '</div>';
       }

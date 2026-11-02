@@ -4,11 +4,11 @@
       title:'Embedding：沿词表切开查表',role:'位于模型入口。将 token ID 查成完整的隐藏向量，再交给 Decoder。',axis:'切分轴 / 词表行',
       steps:['切分前','权重切开','收集 ID','本地查表','求和归还'],
       explanations:[
-        ['各 DP 保存完整词表','DP0 为 A 查 id 1，得到 [0, 1]；DP1 为 B 查 id 3，得到 [2, 1]。每个 die 都保存 4 行词表权重。','LOCAL LOOKUP'],
+        ['各 DP 保存完整词表','DP0 为 A 查 id 0，得到 [1, 0]；DP1 为 B 查 id 3，得到 [2, 1]。每个 die 都保存 4 行词表权重。','LOCAL LOOKUP'],
         ['每个 die 常驻半个词表','DP0 保存 id 0–1，DP1 保存 id 2–3。每行的隐藏维度仍为 2；权重在模型加载时完成切分。','WEIGHT SHARD · VOCAB / 2'],
-        ['把两个请求的 ID 收到组内','AllGather 收集 A 的 id 1、B 的 id 3。两个 die 都收到这两个 ID，分别查各自保存的词表分片。','ALLGATHER · TOKEN ID'],
-        ['命中的分片给向量，其余给零','DP0 对 A 给 [0, 1]，对 B 给 [0, 0]；DP1 对 A 给 [0, 0]，对 B 给 [2, 1]。同一 ID 只有所属分片提供有效值。','LOCAL LOOKUP + MASK'],
-        ['按请求求和并归还','ReduceScatter 对同一 token 的向量求和，再分回原 DP：A 的 [0, 1] 回 DP0，B 的 [2, 1] 回 DP1。','REDUCESCATTER · SUM']
+        ['把两个请求的 ID 收到组内','AllGather 收集 A 的 id 0、B 的 id 3。两个 die 都收到这两个 ID，分别查各自保存的词表分片。','ALLGATHER · TOKEN ID'],
+        ['命中的分片给向量，其余给零','DP0 对 A 给 [1, 0]，对 B 给 [0, 0]；DP1 对 A 给 [0, 0]，对 B 给 [2, 1]。同一 ID 只有所属分片提供有效值。','LOCAL LOOKUP + MASK'],
+        ['按请求求和并归还','ReduceScatter 对同一 token 的向量求和，再分回原 DP：A 的 [1, 0] 回 DP0，B 的 [2, 1] 回 DP1。','REDUCESCATTER · SUM']
       ],
       takeaway:'完整词表 4×2 → 每 die 的词表分片 2×2。交换 token ID、汇总查表结果，输出向量仍是完整 2 维。',
       config:'--data-parallel-size 8 \\\n--tensor-parallel-size 2 \\\n--additional-config \'{"finegrained_tp_config":{"embedding_tensor_parallel_size":4}}\'',
