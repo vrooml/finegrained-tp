@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="交互式理解 GLM5.3Flash 的细粒度 TP：模型位置、权重切分、跨 DP 数据交换与结果归还。">
+<meta name="color-scheme" content="light">
+<title>细粒度 TP · 从权重到数据流</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231c6264'/%3E%3Cpath d='M8 8h7v16H8zM18 8h7v16h-7z' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#lesson">跳到分步演示</a>
+<header class="topbar"><a href="#embedding" class="brand"><span class="brand-icon" aria-hidden="true">Ⅱ</span>并行计算笔记</a><span class="top-tag">GLM5.3Flash · 交互原理图</span><button id="share" class="quiet" type="button">复制当前步骤链接</button></header>
+<div class="page">
+<section class="intro">
+  <div class="eyebrow">FINE-GRAINED TENSOR PARALLELISM</div>
+  <h1>请求按 DP 分工，<br class="mobile-break">模块按权重分片合作。</h1>
+  <p>点击模型中的模块，用「下一步」跟着一个输入走完：切权重 → 交换输入 → 分片计算 → 结果归还。</p>
+</section>
+<div class="workspace">
+<aside class="model-column" aria-label="模型结构与模块选择">
+  <div class="map-heading"><span>01 / 在模型里找位置</span><span class="map-hint">点击彩色模块</span></div>
+  <div class="model-map">
+    <div class="flow-label">输入 token ID</div><div class="flow-arrow" aria-hidden="true">↓</div>
+    <button data-module="embedding" class="model-node"><span class="node-number">01</span><span><b>Embedding</b><small>token ID → 隐藏向量</small></span><span class="node-dot"></span></button>
+    <div class="flow-arrow" aria-hidden="true">↓</div>
+    <div class="decoder-box">
+      <div class="decoder-heading">Decoder 层 <span>× 45</span></div>
+      <div class="flow-label">归一化 / 残差混合</div><div class="flow-arrow small-arrow" aria-hidden="true">↓</div>
+      <div class="attention-box"><span>Attention</span><small>线性 Attention / MLA</small><div class="flow-arrow small-arrow" aria-hidden="true">↓</div><button data-module="oproj" class="model-node"><span class="node-number">02</span><span><b>OProj</b><small>Attention 输出投影</small></span><span class="node-dot"></span></button></div>
+      <div class="flow-arrow small-arrow" aria-hidden="true">↓</div><div class="flow-label">残差混合 / 归一化</div><div class="flow-arrow small-arrow" aria-hidden="true">↓</div>
+      <div class="ffn-box"><span class="ffn-title">FFN</span><button data-module="mlp" class="model-node"><span class="node-number">03</span><span><b>dense MLP</b><small>第 0–2 层 · gate / up / down</small></span><span class="node-dot"></span></button><div class="moe-label">第 3–44 层：MoE · EP 专家并行</div></div>
+    </div>
+    <div class="flow-arrow" aria-hidden="true">↓</div><div class="flow-label">最终 RMSNorm</div><div class="flow-arrow" aria-hidden="true">↓</div>
+    <button data-module="lmhead" class="model-node"><span class="node-number">04</span><span><b>LM Head</b><small>隐藏向量 → 词表 logits</small></span><span class="node-dot"></span></button>
+    <div class="flow-arrow" aria-hidden="true">↓</div><div class="flow-label">采样 → 下一个 token</div>
+  </div>
+  <div class="group-note"><b>细粒度组建在 DP 轴上</b><p>同一组内普通 TP rank 相同。DP8 × TP2、细粒度 TP4：每个 TP 列各建两组四卡组，指定模块按 4 份切权重。</p><div class="group-grid" aria-label="DP8 TP2 细粒度4分组"><span class="group-cell group-0">D0</span><span class="group-cell group-0">D0</span><span class="group-cell group-0">D1</span><span class="group-cell group-0">D1</span><span class="group-cell group-0">D2</span><span class="group-cell group-0">D2</span><span class="group-cell group-0">D3</span><span class="group-cell group-0">D3</span><span class="group-cell group-1">D4</span><span class="group-cell group-1">D4</span><span class="group-cell group-1">D5</span><span class="group-cell group-1">D5</span><span class="group-cell group-1">D6</span><span class="group-cell group-1">D6</span><span class="group-cell group-1">D7</span><span class="group-cell group-1">D7</span></div><div class="group-caption"><span>普通 TP rank 0</span><span>普通 TP rank 1</span></div></div>
+</aside>
+<main id="lesson" class="lesson">
+  <div class="lesson-top"><span class="eyebrow">02 / 跟着数据走一遍</span><span class="demo-scale">DP2 · 普通 TP1 · 细粒度 TP2</span></div>
+  <div class="module-tabs" role="group" aria-label="选择模块"><button data-module="embedding">Embedding</button><button data-module="oproj">OProj</button><button data-module="mlp">MLP</button><button data-module="lmhead">LM Head</button></div>
+  <div class="lesson-heading"><div><h2 id="module-title"></h2><p id="module-role"></p></div><span id="split-axis" class="axis-pill"></span></div>
+  <div class="ownership"><span><i class="owner-dot a"></i><b>DP0 / die0</b> 负责请求 A</span><span><i class="owner-dot b"></i><b>DP1 / die1</b> 负责请求 B</span><small>每个请求取当前一个 token，逐步追踪数据。</small></div>
+  <nav id="step-list" class="step-list" aria-label="选择演示步骤"></nav>
+  <section class="step-caption" aria-live="polite"><div><span id="step-count"></span><h3 id="step-title"></h3></div><p id="step-explanation"></p><span id="communication" class="communication-tag"></span></section>
+  <div class="demo-body"><section id="panel-embedding" class="demo-panel" aria-label="embedding 分步演示" hidden><div id="embedding-dp-steps">
+  <style>
+    #embedding-dp-steps { color: var(--foreground); }
+    #embedding-dp-steps .embed-heading { padding-inline-end: 96px; }
+    #embedding-dp-steps .embed-meta { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-block: 8px 18px; }
+    #embedding-dp-steps .embed-stage { margin-block: 12px; }
+    #embedding-dp-steps .embed-stage-title { font-weight: 500; }
+    #embedding-dp-steps .embed-communication { display: grid; gap: 4px; justify-items: center; margin-block: 16px; text-align: center; }
+    #embedding-dp-steps .embed-lanes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 26px; }
+    #embedding-dp-steps .embed-lane { min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
+    #embedding-dp-steps .embed-device { font-weight: 500; text-align: center; }
+    #embedding-dp-steps .embed-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 6px; }
+    #embedding-dp-steps .embed-section-label { text-align: center; }
+    #embedding-dp-steps .embed-flow { text-align: center; color: var(--muted-foreground); }
+    #embedding-dp-steps .embed-token { display: inline-flex; flex-wrap: wrap; justify-content: center; gap: 5px; padding: 7px 9px; border-radius: 4px; background: color-mix(in srgb, var(--viz-series-1) 14%, transparent); }
+    #embedding-dp-steps .embed-token.embed-part-two { background: color-mix(in srgb, var(--viz-series-2) 14%, transparent); }
+    #embedding-dp-steps .embed-weight { display: grid; grid-template-columns: minmax(46px, 1fr) repeat(2, minmax(32px, 1fr)); gap: 2px; }
+    #embedding-dp-steps .embed-weight-row { display: contents; }
+    #embedding-dp-steps .embed-cell { padding: 5px 4px; text-align: center; min-width: 0; }
+    #embedding-dp-steps .embed-weight-one { background: color-mix(in srgb, var(--viz-series-1) 14%, transparent); }
+    #embedding-dp-steps .embed-weight-two { background: color-mix(in srgb, var(--viz-series-2) 14%, transparent); }
+    #embedding-dp-steps .embed-lookup { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px; align-items: center; }
+    #embedding-dp-steps .embed-vector { display: inline-flex; justify-content: center; gap: 12px; padding: 7px 12px; border-radius: 4px; background: color-mix(in srgb, var(--viz-series-1) 14%, transparent); }
+    #embedding-dp-steps .embed-vector.embed-part-two { background: color-mix(in srgb, var(--viz-series-2) 14%, transparent); }
+    #embedding-dp-steps .embed-vector.embed-zero { background: var(--muted); color: var(--muted-foreground); }
+    #embedding-dp-steps .embed-contributions { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px; }
+    #embedding-dp-steps .embed-footer { margin-block-start: 22px; }
+    #embedding-dp-steps .embed-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-block-start: 18px; }
+    #embedding-dp-steps .embed-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    #embedding-dp-steps .embed-swatch { width: 12px; height: 12px; background: var(--viz-series-1); }
+    #embedding-dp-steps .embed-swatch-two { background: var(--viz-series-2); }
+    @media (max-width: 479px) {
+      #embedding-dp-steps .embed-lanes { grid-template-columns: minmax(0, 1fr); gap: 26px; }
+      #embedding-dp-steps .embed-lane { max-width: 330px; width: 100%; justify-self: center; }
+    }
+  </style>
+  <h3 class="embed-heading">Embedding 细粒度切分</h3>
+  <div class="embed-meta text-small">
+    <span>DP = 2</span><span>普通 TP = 1</span><span id="embed-fg"></span>
+  </div>
+  <div class="embed-stage" aria-live="polite" aria-atomic="true">
+    <div id="embed-stage-title" class="embed-stage-title"></div>
+    <div id="embed-stage-tag" class="text-small"></div>
+  </div>
+  <div id="embed-view" role="group" aria-label="两个 DP 设备的当前 Embedding 数据流"></div>
+  <div class="embed-legend text-small" aria-label="词表分区图例">
+    <span class="embed-legend-item"><span class="embed-swatch" aria-hidden="true"></span>词表 id 0–1</span>
+    <span class="embed-legend-item"><span class="embed-swatch embed-swatch-two" aria-hidden="true"></span>词表 id 2–3</span>
+  </div>
+  <div class="viz-controls embed-footer">
+    <button type="button" class="btn" id="embed-prev">上一步</button>
+    <span id="embed-counter" class="text-small tabular-nums"></span>
+    <button type="button" class="btn btn-primary" id="embed-next">下一步</button>
+  </div>
+  <script>
+    (() => {
+      const root = document.getElementById('embedding-dp-steps');
+      const view = root.querySelector('#embed-view');
+      const previous = root.querySelector('#embed-prev');
+      const next = root.querySelector('#embed-next');
+      const stages = [
+        ['未切分', '每个设备：完整词表 4 行 × 2 维'],
+        ['切开词表权重', '按词表行切分；每个向量仍是完整 2 维'],
+        ['收集 token ID', 'all-gather · A 和 B 的 ID 到两个设备'],
+        ['各查自己的词表', '非本地词表的 token → 零向量'],
+        ['求和并归还请求', 'reduce-scatter（sum）· 按原 DP 归还']
+      ];
+      const table = [[1, 0], [0, 1], [1, 1], [2, 1]];
+      let step = 0;
+      function compatibleState(value) {
+        const model = value && value.modelContent;
+        const saved = model && model.kind === 'embedding-dp-steps' ? model.step : undefined;
+        return Number.isInteger(saved) && saved >= 0 && saved < stages.length ? saved : 0;
+      }
+      step = compatibleState(null);
+      function token(request, id) {
+        return '<span class="embed-token ' + (id >= 2 ? 'embed-part-two' : '') + '"><span>请求 ' + request + '</span><span class="tabular-nums">id ' + id + '</span></span>';
+      }
+      function vector(values, category, label) {
+        return '<span class="embed-vector tabular-nums ' + (category === 2 ? 'embed-part-two' : category === 0 ? 'embed-zero' : '') + '" aria-label="' + label + '：向量 [' + values.join(', ') + ']"><span>[' + values[0] + '</span><span>' + values[1] + ']</span></span>';
+      }
+      function weights(device) {
+        const rows = step === 0 ? [0, 1, 2, 3] : device === 0 ? [0, 1] : [2, 3];
+        let markup = '<div class="embed-section-label text-small">权重 · ' + (step === 0 ? '词表 id 0–3' : device === 0 ? '词表 id 0–1' : '词表 id 2–3') + '</div>';
+        markup += '<div class="embed-weight tabular-nums" role="table" aria-label="设备 ' + device + ' 的 Embedding 权重">';
+        markup += '<div class="embed-weight-row" role="row"><span class="embed-cell text-small" role="columnheader">token id</span><span class="embed-cell text-small" role="columnheader">维 0</span><span class="embed-cell text-small" role="columnheader">维 1</span></div>';
+        rows.forEach(id => {
+          const category = id < 2 ? 'embed-weight-one' : 'embed-weight-two';
+          markup += '<div class="embed-weight-row" role="row"><span class="embed-cell ' + category + '" role="cell">' + id + '</span><span class="embed-cell ' + category + '" role="cell">' + table[id][0] + '</span><span class="embed-cell ' + category + '" role="cell">' + table[id][1] + '</span></div>';
+        });
+        return markup + '</div>';
+      }
+      function lane(device) {
+        const request = device === 0 ? 'A' : 'B';
+        const id = device === 0 ? 1 : 3;
+        let markup = '<div class="embed-lane"><div class="embed-device">设备 ' + device + ' · DP' + device + '</div>';
+        if (step < 4) {
+          markup += '<div class="embed-row">' + token(request, id) + '</div>';
+          if (step >= 2) markup += '<div class="embed-flow" aria-hidden="true">↓</div><div class="embed-row">' + token('A', 1) + token('B', 3) + '</div>';
+          markup += '<div class="embed-flow" aria-hidden="true">↓</div>' + weights(device);
+          if (step === 0) {
+            markup += '<div class="embed-flow" aria-hidden="true">↓</div><div class="embed-row"><span>请求 ' + request + '</span>' + vector(table[id], device + 1, '请求 ' + request + ' 的查表结果') + '</div>';
+          }
+          if (step === 3) {
+            markup += '<div class="embed-flow" aria-hidden="true">↓</div><div class="embed-lookup"><span>A · id 1</span>' + vector(device === 0 ? [0, 1] : [0, 0], device === 0 ? 1 : 0, device === 0 ? 'A 本地查表' : 'A 非本地词表，置零') + '<span>B · id 3</span>' + vector(device === 1 ? [2, 1] : [0, 0], device === 1 ? 2 : 0, device === 1 ? 'B 本地查表' : 'B 非本地词表，置零') + '</div>';
+          }
+        } else {
+          markup += '<div class="embed-section-label">请求 ' + request + ' · id ' + id + '</div><div class="embed-contributions"><span class="text-small">来自设备 0</span>' + vector(device === 0 ? [0, 1] : [0, 0], device === 0 ? 1 : 0, '来自设备 0 的部分结果') + '<span class="text-small">来自设备 1</span>' + vector(device === 1 ? [2, 1] : [0, 0], device === 1 ? 2 : 0, '来自设备 1 的部分结果') + '</div><div class="embed-flow">↓ 求和</div><div class="embed-row">' + token(request, id) + vector(table[id], device + 1, '归还请求 ' + request + ' 的完整 Embedding') + '</div><div class="embed-section-label text-small">完整 2 维 → 后续层</div>';
+        }
+        return markup + '</div>';
+      }
+      function render() {
+        root.querySelector('#embed-stage-title').textContent = stages[step][0];
+        root.querySelector('#embed-stage-tag').textContent = stages[step][1];
+        root.querySelector('#embed-fg').textContent = step === 0 ? '细粒度 TP：关闭' : '细粒度 TP = 2';
+        root.querySelector('#embed-counter').textContent = (step + 1) + ' / ' + stages.length;
+        previous.disabled = step === 0;
+        next.disabled = step === stages.length - 1;
+        const communication = step === 2 ? 'all-gather · token ID' : step === 4 ? 'reduce-scatter · sum + 归还' : '';
+        view.innerHTML = (communication ? '<div class="embed-communication"><span class="text-small">设备 0 ↔ 设备 1</span><span>' + communication + '</span></div>' : '') + '<div class="embed-lanes">' + lane(0) + lane(1) + '</div>';
+      }
+      function move(delta) {
+        step = Math.min(stages.length - 1, Math.max(0, step + delta));
+        render();
+      }
+      previous.addEventListener('click', () => move(-1));
+      next.addEventListener('click', () => move(1));
+      render();
+    })();
+  </script>
+</div>
+</section>
+<section id="panel-oproj" class="demo-panel" aria-label="oproj 分步演示" hidden><div id="oproj-dp-explainer" aria-label="O projection 沿 DP 切分的五步示意">
+  <style>
+    #oproj-dp-explainer { color: var(--foreground); }
+    #oproj-dp-explainer .op-top { padding-right: 96px; margin-bottom: 12px; }
+    #oproj-dp-explainer .op-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    #oproj-dp-explainer .op-title { font-weight: 500; margin: 0 0 6px; }
+    #oproj-dp-explainer .op-legend { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+    #oproj-dp-explainer .op-key { display: inline-flex; align-items: center; gap: 6px; }
+    #oproj-dp-explainer .op-dot { width: 12px; height: 12px; display: inline-block; background: var(--viz-series-1); }
+    #oproj-dp-explainer .op-dot.op-right { background: var(--viz-series-2); }
+    #oproj-dp-explainer .op-lanes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+    #oproj-dp-explainer .op-lane { min-width: 0; }
+    #oproj-dp-explainer .op-device { font-weight: 500; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+    #oproj-dp-explainer .op-block { margin-top: 16px; }
+    #oproj-dp-explainer .op-label { margin-bottom: 6px; }
+    #oproj-dp-explainer .op-vector { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+    #oproj-dp-explainer .op-token { min-width: 30px; font-weight: 500; }
+    #oproj-dp-explainer .op-segment { display: inline-flex; gap: 12px; padding: 8px 12px; background: color-mix(in srgb, var(--viz-series-1) 15%, transparent); }
+    #oproj-dp-explainer .op-segment.op-right { background: color-mix(in srgb, var(--viz-series-2) 15%, transparent); }
+    #oproj-dp-explainer .op-segment.op-neutral { background: var(--muted); color: var(--muted-foreground); }
+    #oproj-dp-explainer .op-weight { display: grid; gap: 3px; max-width: 240px; }
+    #oproj-dp-explainer .op-weight-row { display: grid; grid-template-columns: 1fr 36px 36px; gap: 8px; padding: 4px 8px; background: color-mix(in srgb, var(--viz-series-1) 15%, transparent); }
+    #oproj-dp-explainer .op-weight-row.op-right { background: color-mix(in srgb, var(--viz-series-2) 15%, transparent); }
+    #oproj-dp-explainer .op-weight-row span:not(:first-child) { text-align: center; }
+    #oproj-dp-explainer .op-transfer { display: flex; gap: 8px 24px; justify-content: center; flex-wrap: wrap; padding: 8px 0 16px; }
+    #oproj-dp-explainer .op-transfer span { overflow-wrap: anywhere; }
+    #oproj-dp-explainer .op-status { margin-top: 18px; padding-top: 10px; border-top: 1px solid var(--border); }
+    @media (max-width: 480px) {
+      #oproj-dp-explainer .op-lanes { grid-template-columns: 1fr; gap: 24px; }
+      #oproj-dp-explainer .op-top { padding-right: 90px; }
+    }
+  </style>
+  <div class="op-top">
+    <div class="op-title">O projection · 按输入特征切权重</div>
+    <div class="text-small">DP2 · 普通 TP1 · 细粒度2</div>
+  </div>
+  <div class="op-toolbar">
+    <button type="button" class="btn" data-op-prev aria-label="O projection 上一步">上一步</button>
+    <span data-op-step class="tabular-nums" aria-live="polite"></span>
+    <button type="button" class="btn btn-primary" data-op-next aria-label="O projection 下一步">下一步</button>
+  </div>
+  <div class="op-legend text-small">
+    <span class="op-key"><span class="op-dot" aria-hidden="true"></span>输入特征：前2维</span>
+    <span class="op-key"><span class="op-dot op-right" aria-hidden="true"></span>输入特征：后2维</span>
+  </div>
+  <div data-op-visual role="group" aria-label="当前步骤的设备、输入与权重" class="tabular-nums"></div>
+  <div data-op-status class="op-status text-small" aria-live="polite"></div>
+  <div class="sr-only">示例采用四维输入、二维输出。A、B 分别是两个请求当前 token 的 Attention 输出向量。数字为教学示例，省略偏置、量化和 padding。</div>
+  <script>
+    (() => {
+      const root = document.getElementById('oproj-dp-explainer');
+      const visual = root.querySelector('[data-op-visual]');
+      const stepLabel = root.querySelector('[data-op-step]');
+      const status = root.querySelector('[data-op-status]');
+      const prev = root.querySelector('[data-op-prev]');
+      const next = root.querySelector('[data-op-next]');
+      const names = ['未切分', '切权重', '交换输入', '计算部分贡献', '求和并归还'];
+      const details = [
+        '每设备：完整权重4×2；各算自己的 token',
+        '每设备：半份权重2×2；输出维仍为2',
+        'all-to-all：从按 token 分工，变为按输入特征分工',
+        '每设备：同时计算 A、B 的部分贡献；每份贡献都有2个输出维',
+        'reduce-scatter(sum)：按 token 相加，再归还原 DP'
+      ];
+      const w = [[1,0], [0,1], [1,1], [2,0]];
+      const tokens = { A: [1,2,3,4], B: [5,6,7,8] };
+      const partial = (v, side) => {
+        const start = side * 2;
+        return [0,1].map(j => v.slice(start, start + 2).reduce((sum, x, k) => sum + x * w[start + k][j], 0));
+      };
+      const result = name => partial(tokens[name], 0).map((v, i) => v + partial(tokens[name], 1)[i]);
+      const segment = (values, side) => '<span class="op-segment' + (side === 1 ? ' op-right' : side === 2 ? ' op-neutral' : '') + '">' + values.map(v => '<span>' + v + '</span>').join('') + '</span>';
+      const vector = (label, values, side) => '<div class="op-vector"><span class="op-token">' + label + '</span>' + (side === undefined ? segment(values.slice(0,2), 0) + segment(values.slice(2), 1) : segment(values, side)) + '</div>';
+      const weights = side => {
+        const indices = side === undefined ? [0,1,2,3] : side === 0 ? [0,1] : [2,3];
+        return '<div class="op-weight">' + indices.map(i => '<div class="op-weight-row' + (i > 1 ? ' op-right' : '') + '"><span>输入维 ' + (i+1) + '</span><span>' + w[i][0] + '</span><span>' + w[i][1] + '</span></div>').join('') + '</div>';
+      };
+      const block = (label, content) => '<div class="op-block"><div class="op-label text-small">' + label + '</div>' + content + '</div>';
+      let step = 0;
+      const restore = state => {
+        const saved = state && state.modelContent;
+        if (saved && saved.kind === 'oproj-dp' && Number.isInteger(saved.step)) step = Math.max(0, Math.min(4, saved.step));
+      };
+      restore(null);
+      const render = () => {
+        let transfer = '';
+        if (step === 2) transfer = '<div class="op-transfer text-small"><span>DP0 → DP1：A 后2维 [3, 4]</span><span>DP1 → DP0：B 前2维 [5, 6]</span></div>';
+        if (step === 4) transfer = '<div class="op-transfer text-small"><span>DP1 → DP0：A 后片贡献 [11, 3]</span><span>DP0 → DP1：B 前片贡献 [5, 6]</span></div>';
+        let lanes = '';
+        for (let device = 0; device < 2; device++) {
+          const own = device === 0 ? 'A' : 'B';
+          let content = '';
+          if (step <= 1) content += block('Attention 输出 · 当前 token', vector(own, tokens[own]));
+          if (step === 2 || step === 3) content += block('当前负责的输入特征 · ' + (device === 0 ? '前2维' : '后2维'), ['A','B'].map(n => vector(n, tokens[n].slice(device*2, device*2+2), device)).join(''));
+          content += block(step === 0 ? '完整权重 · 4个输入维 → 2个输出维' : (device === 0 ? '权重前片 · 输入维1–2' : '权重后片 · 输入维3–4') + ' → 2个输出维', weights(step === 0 ? undefined : device));
+          if (step === 0) content += block('本地完整输出', vector(own, result(own), 2));
+          if (step === 3) content += block('部分贡献 · 尚需与另一设备相加', ['A','B'].map(n => vector(n, partial(tokens[n], device), device)).join(''));
+          if (step === 4) {
+            content += block('本地贡献', vector(own, partial(tokens[own], device), device));
+            content += block('另一设备的贡献', vector(own, partial(tokens[own], 1-device), 1-device));
+            content += block('相加后的完整输出 · 仍归本 DP', vector(own, result(own), 2));
+          }
+          lanes += '<section class="op-lane" aria-label="设备' + device + '，DP' + device + '"><div class="op-device">设备' + device + ' · DP' + device + ' · 请求' + own + '</div>' + content + '</section>';
+        }
+        visual.innerHTML = transfer + '<div class="op-lanes">' + lanes + '</div>';
+        stepLabel.textContent = (step+1) + ' / 5 · ' + names[step];
+        status.textContent = details[step];
+        prev.disabled = step === 0;
+        next.disabled = step === 4;
+      };
+      const move = delta => {
+        step = Math.max(0, Math.min(4, step + delta));
+        render();
+        if (window.openai && window.openai.setWidgetState) {
+          window.openai.setWidgetState({ modelContent: { kind: 'oproj-dp', step, scenario: 'DP2 TP1 finegrained2; input4 output2' }, privateContent: null }).catch(() => {});
+        }
+      };
+      prev.addEventListener('click', () => move(-1));
+      next.addEventListener('click', () => move(1));
+      render();
+    })();
+  </script>
+</div>
+</section>
+<section id="panel-mlp" class="demo-panel" aria-label="mlp 分步演示" hidden><div id="mlp-dp-steps" class="mlps-root">
+  <h3>MLP：切中间通道，完整输出回原 DP</h3>
+  <div class="mlps-meta text-small">DP2 · 普通 TP1 · 细粒度 MLP2 · hidden 2 维 · 中间 4 通道</div>
+  <div class="mlps-nav viz-controls">
+    <button type="button" class="btn" data-prev>上一步</button>
+    <span class="mlps-status tabular-nums" aria-live="polite" data-status></span>
+    <button type="button" class="btn btn-primary" data-next>下一步</button>
+  </div>
+  <div class="mlps-legend text-small" aria-label="中间通道颜色">
+    <span><i class="mlps-swatch mlps-front" aria-hidden="true"></i>中间通道 1–2（前片）</span>
+    <span><i class="mlps-swatch mlps-back" aria-hidden="true"></i>中间通道 3–4（后片）</span>
+  </div>
+  <div data-scene role="img" aria-label="MLP 在两个 DP 设备上的计算步骤"></div>
+  <div class="mlps-scope text-small text-muted">dense MLP · gate / up → SwiGLU → down</div>
+</div>
+<style>
+#mlp-dp-steps { color: var(--foreground); }
+#mlp-dp-steps h3 { margin: 0 96px 8px 0; }
+#mlp-dp-steps .mlps-meta { color: var(--muted-foreground); margin-bottom: 14px; overflow-wrap: anywhere; }
+#mlp-dp-steps .mlps-nav { margin-bottom: 12px; }
+#mlp-dp-steps .mlps-status { flex: 1 1 130px; text-align: center; }
+#mlp-dp-steps .mlps-legend { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-bottom: 18px; }
+#mlp-dp-steps .mlps-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+#mlp-dp-steps .mlps-swatch { display: inline-block; width: 15px; height: 12px; }
+#mlp-dp-steps .mlps-front { background: color-mix(in srgb, var(--viz-series-1) 18%, transparent); }
+#mlp-dp-steps .mlps-back { background: color-mix(in srgb, var(--viz-series-2) 18%, transparent); }
+#mlp-dp-steps .mlps-lanes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+#mlp-dp-steps .mlps-lane { min-width: 0; }
+#mlp-dp-steps .mlps-device { font-weight: 500; margin-bottom: 12px; }
+#mlp-dp-steps .mlps-owner { color: var(--muted-foreground); margin-left: 8px; }
+#mlp-dp-steps .mlps-label { margin: 8px 0 6px; }
+#mlp-dp-steps .mlps-data { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 6px 0; }
+#mlp-dp-steps .mlps-data code { color: var(--foreground); background: transparent; }
+#mlp-dp-steps .mlps-pair { display: grid; gap: 7px; }
+#mlp-dp-steps .mlps-channel-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+#mlp-dp-steps .mlps-channel-row.mlps-half { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+#mlp-dp-steps .mlps-channel { min-width: 0; text-align: center; padding: 8px 3px; color: var(--foreground); }
+#mlp-dp-steps .mlps-branch { padding: 9px; color: var(--foreground); min-width: 0; overflow-wrap: anywhere; }
+#mlp-dp-steps .mlps-flow { text-align: center; color: var(--muted-foreground); padding: 7px 0; }
+#mlp-dp-steps .mlps-collective { display: grid; gap: 6px; justify-items: center; text-align: center; margin: 14px 0; padding: 10px 4px; background: color-mix(in srgb, var(--muted) 50%, transparent); }
+#mlp-dp-steps .mlps-subtle { color: var(--muted-foreground); }
+#mlp-dp-steps .mlps-result { padding: 10px 0; font-weight: 500; }
+#mlp-dp-steps .mlps-scope { margin-top: 17px; }
+@media (max-width: 480px) {
+  #mlp-dp-steps .mlps-lanes { grid-template-columns: minmax(0, 1fr); gap: 22px; }
+  #mlp-dp-steps .mlps-status { flex-basis: 110px; }
+}
+</style>
+<script>
+(() => {
+  const root = document.getElementById('mlp-dp-steps');
+  const scene = root.querySelector('[data-scene]');
+  const status = root.querySelector('[data-status]');
+  const prev = root.querySelector('[data-prev]');
+  const next = root.querySelector('[data-next]');
+  const kind = 'mlp-dp-steps-v1';
+  const titles = ['未切分：各算自己的 token', '按中间通道切权重', 'all-gather：收齐完整输入', '各片计算：得到全维部分和', 'reduce-scatter：求和并归还'];
+  let step = 0;
+  const text = value => String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  const data = values => `<div class="mlps-data">${values.map(x => `<code>${text(x)}</code>`).join('')}</div>`;
+  const channels = (items, half = false) => `<div class="mlps-channel-row${half ? ' mlps-half' : ''}">${items.map(n => `<div class="mlps-channel ${n < 3 ? 'mlps-front' : 'mlps-back'}">通道 ${n}</div>`).join('')}</div>`;
+  const flow = label => `<div class="mlps-flow text-small">↓ ${label}</div>`;
+  const branch = (which, content) => `<div class="mlps-branch ${which === 0 ? 'mlps-front' : 'mlps-back'}">${content}</div>`;
+  const lane = (n, body) => `<section class="mlps-lane"><div class="mlps-device">设备 ${n}<span class="mlps-owner text-small">DP${n} · 请求 ${n === 0 ? 'A' : 'B'}</span></div>${body}</section>`;
+  const lanes = bodies => `<div class="mlps-lanes">${bodies.map((body, n) => lane(n, body)).join('')}</div>`;
+  const collective = (label, detail) => `<div class="mlps-collective"><span>${label}</span><span class="text-small mlps-subtle">${detail}</span></div>`;
+  const localInput = n => data([n === 0 ? 'A [a1 a2]' : 'B [b1 b2]']);
+  const allInput = () => data(['A [a1 a2]', 'B [b1 b2]']);
+  const fullWeights = '<div class="mlps-label text-small">gate 与 up：各含全部 4 个输出通道</div>' + channels([1,2,3,4]) + flow('SwiGLU 激活') + '<div class="mlps-label text-small">down：4 个输入通道 → hidden 2 维</div>' + channels([1,2,3,4]);
+  const splitWeights = n => {
+    const range = n === 0 ? '1–2' : '3–4';
+    return '<div class="mlps-label text-small">gate / up：保留完整 hidden 输入</div>' + branch(n, `<div>gate 输出通道 ${range}</div><div>up 输出通道 ${range}</div>`) + flow('对应通道成对保留') + branch(n, `<div>down 输入通道 ${range}</div><div class="text-small">输出维度：h1、h2 全部保留</div>`);
+  };
+  const partial = n => branch(n, `<div class="text-small">${n === 0 ? '前片' : '后片'}对完整输出的贡献</div>` + data(n === 0 ? ['A [pA1 pA2]', 'B [pB1 pB2]'] : ['A [qA1 qA2]', 'B [qB1 qB2]']));
+  function render() {
+    status.textContent = `${step + 1} / ${titles.length} · ${titles[step]}`;
+    prev.disabled = step === 0;
+    next.disabled = step === titles.length - 1;
+    scene.setAttribute('aria-label', `第 ${step + 1} 步，${titles[step]}。${step === 4 ? '两片贡献按相同 token 求和，A 的完整输出回到 DP0，B 的完整输出回到 DP1。' : '每个请求只展示一个 token，hidden 有两个维度，MLP 中间有四个通道。'}`);
+    if (step === 0) {
+      scene.innerHTML = lanes([0,1].map(n => localInput(n) + fullWeights + flow('本地完成') + `<div class="mlps-result">${n === 0 ? 'A' : 'B'} 完整输出 [h1 h2]</div>`));
+    } else if (step === 1) {
+      scene.innerHTML = lanes([0,1].map(n => localInput(n) + splitWeights(n)));
+    } else if (step === 2) {
+      scene.innerHTML = lanes([localInput(0), localInput(1)]) + collective('↓ all-gather ↓', '沿 token 维收集 · 不切 hidden 维') + lanes([0,1].map(n => allInput() + flow('A、B 都送入本地权重片') + splitWeights(n)));
+    } else if (step === 3) {
+      scene.innerHTML = lanes([0,1].map(n => allInput() + flow('本片 gate / up') + channels(n === 0 ? [1,2] : [3,4], true) + flow('SwiGLU 激活') + branch(n, n === 0 ? 'A、B 的中间通道 1–2' : 'A、B 的中间通道 3–4') + flow('本片 down：投影到 h1、h2') + partial(n)));
+    } else {
+      scene.innerHTML = lanes([partial(0), partial(1)]) + collective('↓ reduce-scatter（sum）↓', '同一 token 的前片、后片贡献相加 · 按 token 分回原 DP') + lanes([0,1].map(n => `<div class="mlps-result">${n === 0 ? 'A' : 'B'} 完整输出 [h1 h2]</div><div class="text-small mlps-subtle">回到 DP${n} · 接着处理请求 ${n === 0 ? 'A' : 'B'}</div>`));
+    }
+  }
+  function restore(saved) {
+    const candidate = saved && saved.modelContent;
+    if (candidate && candidate.kind === kind && Number.isInteger(candidate.step) && candidate.step >= 0 && candidate.step < titles.length) step = candidate.step;
+    else step = 0;
+    render();
+  }
+  function move(delta) {
+    step = Math.max(0, Math.min(titles.length - 1, step + delta));
+    render();
+  }
+  prev.addEventListener('click', () => move(-1));
+  next.addEventListener('click', () => move(1));
+  restore(null);
+})();
+</script>
+</section>
+<section id="panel-lmhead" class="demo-panel" aria-label="lmhead 分步演示" hidden><div id="lmhead-split-steps">
+  <style>
+    #lmhead-split-steps { color: var(--foreground); }
+    #lmhead-split-steps .context { margin: 0 0 16px; }
+    #lmhead-split-steps .step-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+    #lmhead-split-steps .die-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; }
+    #lmhead-split-steps .die { min-width: 0; }
+    #lmhead-split-steps .die h3 { margin: 0 0 4px; }
+    #lmhead-split-steps .owner { margin-bottom: 20px; color: var(--muted-foreground); }
+    #lmhead-split-steps .label { margin: 16px 0 8px; font-weight: 500; }
+    #lmhead-split-steps .weights { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+    #lmhead-split-steps .weight { padding: 10px 0; text-align: center; }
+    #lmhead-split-steps .part0 { background: color-mix(in srgb, var(--viz-series-1) 18%, transparent); }
+    #lmhead-split-steps .part1 { background: color-mix(in srgb, var(--viz-series-2) 18%, transparent); }
+    #lmhead-split-steps .absent { color: var(--muted-foreground); background: color-mix(in srgb, var(--foreground) 4%, transparent); }
+    #lmhead-split-steps .weight-status { margin-top: 6px; color: var(--muted-foreground); }
+    #lmhead-split-steps .inputs { display: flex; flex-wrap: wrap; gap: 8px; min-height: 40px; align-items: center; }
+    #lmhead-split-steps .input-mark { padding: 6px 10px; background: var(--muted); color: var(--foreground); }
+    #lmhead-split-steps .input-mark.copied { background: color-mix(in srgb, var(--viz-series-1) 12%, transparent); }
+    #lmhead-split-steps .score-area { min-height: 125px; }
+    #lmhead-split-steps table { width: 100%; table-layout: fixed; }
+    #lmhead-split-steps th, #lmhead-split-steps td { text-align: center; padding: 8px 2px; }
+    #lmhead-split-steps th:first-child, #lmhead-split-steps td:first-child { text-align: left; width: 20%; }
+    #lmhead-split-steps .placeholder { min-height: 100px; display: flex; align-items: center; justify-content: center; color: var(--muted-foreground); }
+    #lmhead-split-steps .communication { margin-top: 18px; }
+    #lmhead-split-steps .communication svg { display: block; width: 100%; overflow: visible; }
+    #lmhead-split-steps .communication text { fill: var(--foreground); }
+    #lmhead-split-steps .status { margin-top: 14px; min-height: 24px; font-weight: 500; }
+    #lmhead-split-steps .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; color: var(--muted-foreground); }
+    #lmhead-split-steps .legend span { display: inline-flex; gap: 6px; align-items: center; }
+    #lmhead-split-steps .swatch { display: inline-block; width: 12px; height: 12px; }
+    #lmhead-split-steps .swatch0 { background: var(--viz-series-1); }
+    #lmhead-split-steps .swatch1 { background: var(--viz-series-2); }
+    @media (max-width: 540px) {
+      #lmhead-split-steps .die-grid { grid-template-columns: 1fr; gap: 20px; }
+      #lmhead-split-steps .die + .die { padding-top: 16px; border-top: 1px solid var(--border); }
+      #lmhead-split-steps .owner { margin-bottom: 10px; }
+      #lmhead-split-steps .score-area { min-height: 0; }
+    }
+  </style>
+
+  <h2>LM Head：两颗 die 分担一个词表</h2>
+  <div class="context text-small">DP2 · TP1 · 细粒度 TP2 · 词表 4 个 token · A、B 各取一个预测位置</div>
+  <div class="step-controls" role="group" aria-label="查看切分过程">
+    <button class="btn" type="button" data-step="0" aria-pressed="true">原来：各算各的</button>
+    <button class="btn" type="button" data-step="1" aria-pressed="false">① 权重切半</button>
+    <button class="btn" type="button" data-step="2" aria-pressed="false">② 交换输入并算分</button>
+    <button class="btn" type="button" data-step="3" aria-pressed="false">③ 分数归还</button>
+  </div>
+  <div class="die-grid">
+    <section class="die" data-die="0" aria-label="die0，DP0，请求A">
+      <h3>die 0 / DP0</h3>
+      <div class="owner">请求归属：A（始终不变）</div>
+      <div class="label">常驻的 LM Head 权重</div>
+      <div class="weights" data-weights="0"></div>
+      <div class="weight-status text-small" data-weight-status="0"></div>
+      <div class="label">本步参与计算的输入向量</div>
+      <div class="inputs" data-inputs="0"></div>
+      <div class="label" data-score-label="0"></div>
+      <div class="score-area" data-scores="0"></div>
+    </section>
+    <section class="die" data-die="1" aria-label="die1，DP1，请求B">
+      <h3>die 1 / DP1</h3>
+      <div class="owner">请求归属：B（始终不变）</div>
+      <div class="label">常驻的 LM Head 权重</div>
+      <div class="weights" data-weights="1"></div>
+      <div class="weight-status text-small" data-weight-status="1"></div>
+      <div class="label">本步参与计算的输入向量</div>
+      <div class="inputs" data-inputs="1"></div>
+      <div class="label" data-score-label="1"></div>
+      <div class="score-area" data-scores="1"></div>
+    </section>
+  </div>
+  <div class="communication" data-communication></div>
+  <div class="status" data-status aria-live="polite"></div>
+  <div class="legend text-small">
+    <span><i class="swatch swatch0" aria-hidden="true"></i>词表前半：词1、词2</span>
+    <span><i class="swatch swatch1" aria-hidden="true"></i>词表后半：词3、词4</span>
+    <span>示例 logits</span>
+  </div>
+
+  <script>
+    (() => {
+      const root = document.getElementById('lmhead-split-steps');
+      const buttons = Array.from(root.querySelectorAll('[data-step]'));
+      const communication = root.querySelector('[data-communication]');
+      const scores = { A: [2, 1, 4, 0], B: [1, 3, 0, 2] };
+      const summaries = [
+        '每 die 保存整个词表的权重；只计算自己的请求。',
+        '细粒度 = 2：每 die 只存半个词表的权重。',
+        '两颗 die 都算 A、B，但各自只算半个词表。',
+        'die0 收齐 A，die1 收齐 B；每 die 的常驻权重仍只有一半。'
+      ];
+      let step = 0;
+      const validStep = value => Number.isInteger(value) && value >= 0 && value <= 3;
+      const readStep = state => {
+        const candidate = state && state.modelContent && state.modelContent.step;
+        return validStep(candidate) ? candidate : 0;
+      };
+      step = readStep(null);
+
+      function scoreTable(requests, die, partial) {
+        const head = '<thead><tr><th scope="col">请求</th><th scope="col">词1</th><th scope="col">词2</th><th scope="col">词3</th><th scope="col">词4</th></tr></thead>';
+        const rows = requests.map(request => '<tr><th scope="row">' + request + '</th>' + scores[request].map((value, index) => {
+          const present = !partial || (die === 0 ? index < 2 : index >= 2);
+          return '<td class="tabular-nums ' + (present ? (index < 2 ? 'part0' : 'part1') : 'absent') + '"' + (present ? '' : ' aria-label="此 die 未计算"') + '>' + (present ? value : '—') + '</td>';
+        }).join('') + '</tr>').join('');
+        return '<table class="table table-sm" aria-label="候选 token 的示例分数">' + head + '<tbody>' + rows + '</tbody></table>';
+      }
+
+      function drawCommunication(animate) {
+        const width = Math.max(260, Math.floor(communication.getBoundingClientRect().width));
+        if (step < 2) {
+          communication.innerHTML = '<div class="text-small">' + (step === 0 ? '本层跨 DP 通信：无' : '权重在启动时切好并常驻；图中切换仅为演示') + '</div>';
+          return;
+        }
+        const messages = step === 2
+          ? ['A 的隐藏向量', 'B 的隐藏向量']
+          : ['B 的词1、词2分数', 'A 的词3、词4分数'];
+        const left = 50;
+        const right = width - 50;
+        const namespace = 'lmh-step-arrow';
+        let svg = '<svg role="img" aria-label="' + (step === 2 ? 'die0发送A的隐藏向量给die1，die1发送B的隐藏向量给die0。请求归属不变。' : 'die0将B的前半词表分数交给die1，die1将A的后半词表分数交给die0。') + '" viewBox="0 0 ' + width + ' 112" height="112">';
+        svg += '<defs><marker id="' + namespace + '" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--foreground)"/></marker></defs>';
+        [0, 1].forEach(row => {
+          const y = 34 + row * 44;
+          const from = row === 0 ? left : right;
+          const to = row === 0 ? right : left;
+          svg += '<text class="text-small" x="4" y="' + (y + 4) + '">die0</text><text class="text-small" x="' + (width - 4) + '" y="' + (y + 4) + '" text-anchor="end">die1</text>';
+          svg += '<text class="text-small" x="' + (width / 2) + '" y="' + (y - 10) + '" text-anchor="middle">' + messages[row] + '</text>';
+          svg += '<path d="M ' + from + ' ' + y + ' L ' + to + ' ' + y + '" fill="none" stroke="var(--muted-foreground)" stroke-width="1.5" marker-end="url(#' + namespace + ')"/>';
+          svg += '<circle data-packet data-from="' + from + '" data-to="' + to + '" cx="0" cy="' + y + '" r="4" fill="var(--viz-series-' + (row + 1) + ')" transform="translate(' + to + ' 0)"/>';
+        });
+        svg += '<text class="text-small" x="' + (width / 2) + '" y="108" text-anchor="middle">' + (step === 2 ? '交换输入向量 · AllGather' : '按请求分发分数 · AllToAll') + '</text></svg>';
+        communication.innerHTML = svg;
+        if (animate && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+          communication.querySelectorAll('[data-packet]').forEach(packet => {
+            packet.animate([
+              { transform: 'translateX(' + packet.dataset.from + 'px)' },
+              { transform: 'translateX(' + packet.dataset.to + 'px)' }
+            ], { duration: 800, easing: 'ease-in-out', iterations: 1 });
+          });
+        }
+      }
+
+      function render(animate) {
+        buttons.forEach(button => button.setAttribute('aria-pressed', String(Number(button.dataset.step) === step)));
+        for (let die = 0; die < 2; die++) {
+          const ownRequest = die === 0 ? 'A' : 'B';
+          root.querySelector('[data-weights="' + die + '"]').innerHTML = [0, 1, 2, 3].map(index => {
+            const present = step === 0 || (die === 0 ? index < 2 : index >= 2);
+            return '<div class="weight ' + (present ? (index < 2 ? 'part0' : 'part1') : 'absent') + '"><span>词' + (index + 1) + '</span><span class="text-small">' + (present ? '权重' : '不存') + '</span></div>';
+          }).join('');
+          root.querySelector('[data-weight-status="' + die + '"]').textContent = step === 0 ? '完整词表权重 · 4/4' : '半个词表权重 · 2/4';
+          const requests = step >= 2 ? ['A', 'B'] : [ownRequest];
+          root.querySelector('[data-inputs="' + die + '"]').innerHTML = requests.map(request => '<span class="input-mark' + (request !== ownRequest ? ' copied' : '') + '">' + request + ' 的隐藏向量' + (request !== ownRequest ? '（收到副本）' : '') + '</span>').join('');
+          root.querySelector('[data-score-label="' + die + '"]').textContent = step === 3 ? '归还后：本请求的完整分数' : '此 die 算出的分数';
+          root.querySelector('[data-scores="' + die + '"]').innerHTML = step === 1 ? '<div class="placeholder">下一步：交换输入，再算分</div>' : scoreTable(step === 2 ? ['A', 'B'] : [ownRequest], die, step === 2);
+        }
+        root.querySelector('[data-status]').textContent = summaries[step];
+        drawCommunication(animate);
+      }
+
+      buttons.forEach(button => button.addEventListener('click', () => {
+        const nextStep = Number(button.dataset.step);
+        if (step === nextStep) return;
+        step = nextStep;
+        render(true);
+      }));
+      render(false);
+      const observer = new ResizeObserver(() => drawCommunication(false));
+      observer.observe(communication);
+    })();
+  </script>
+</div>
+</section></div>
+  <div class="step-actions"><button id="previous" class="btn" type="button">← 上一步</button><button id="reset" class="quiet" type="button">回到切分前</button><span class="keyboard-hint">← → 切换步骤</span><button id="next" class="btn btn-primary" type="button">下一步 →</button></div>
+  <section class="takeaway"><div class="eyebrow">切分前 → 切分后</div><p id="takeaway"></p><div class="result-check"><span>请求 A → DP0</span><span>请求 B → DP1</span><small>完整结果交回原 DP，继续后续计算。</small></div></section>
+  <details class="config-details"><summary>查看这项功能的开启参数</summary><div id="config-note"></div><pre><code id="config-code"></code></pre><button id="copy-config" class="btn" type="button">复制参数</button></details>
+</main>
+</div>
+<footer><span>GLM5.3Flash · 细粒度 TP 原理</span><span>权重常驻分片 · 通信按模型执行步发生</span></footer>
+</div>
+<div id="toast" role="status" hidden></div>
+<noscript><p class="noscript">请启用 JavaScript，使用分步交互图。</p></noscript>
+<script src="app.js"></script>
+</body></html>
